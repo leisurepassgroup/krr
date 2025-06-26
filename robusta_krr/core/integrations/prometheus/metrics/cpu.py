@@ -23,7 +23,7 @@ class CPULoader(PrometheusMetric):
                         {cluster_label}
                     }}[{step}]
                 )
-            ) by (container, job)
+            ) by (container, pod, job)
         """
 
 
@@ -51,7 +51,7 @@ def PercentileCPULoader(percentile: float) -> type[PrometheusMetric]:
                                 {cluster_label}
                             }}[{step}]
                         )
-                    ) by (container, pod, job)
+                    ) by (container, job)
                     [{duration}:{step}]
                 )
             """
