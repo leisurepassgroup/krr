@@ -201,7 +201,12 @@ class PrometheusMetric(BaseMetric):
         if self.filtering:
             result = self.filter_prom_jobs_results(result)
 
-        return {pod_result["metric"]["pod"]: np.array(pod_result["values"], dtype=np.float64) for pod_result in result}
+        if self.__class__.__name__ == "PercentileCPULoader":
+            if len(result) != 1:
+                raise RuntimeError("Expected just 1 result for PercentileCPULoader")
+            return {object.name: np.array(pod_result["values"], dtype=np.float64) for pod_result in result}
+        else:
+            return {pod_result["metric"]["pod"]: np.array(pod_result["values"], dtype=np.float64) for pod_result in result}
 
     # --------------------- Filtering Jobs --------------------- #
 

@@ -23,7 +23,7 @@ class CPULoader(PrometheusMetric):
                         {cluster_label}
                     }}[{step}]
                 )
-            ) by (container, pod, job)
+            ) by (container, job)
         """
 
 
