@@ -17,12 +17,16 @@ TEST_OBJECT = K8sObjectData(
         PodData(name="mock-pod-2", deleted=False),
         PodData(name="mock-pod-3", deleted=True),
     ],
+    hpa=None,
+    vpa=None,
     namespace="default",
     kind="Deployment",
     allocations=ResourceAllocations(
         requests={"cpu": 1, "memory": 1},  # type: ignore
         limits={"cpu": 2, "memory": 2},  # type: ignore
     ),
+    labels=None,
+    annotations=None,
 )
 
 

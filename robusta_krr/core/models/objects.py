@@ -28,6 +28,15 @@ class HPAData(pd.BaseModel):
     target_memory_utilization_percentage: Optional[float]
 
 
+class VPAData(pd.BaseModel):
+    """Which request/limit fields VPA manages for this container (from spec.resourcePolicy)."""
+
+    cpu_requests_managed: bool = False
+    cpu_limits_managed: bool = False
+    memory_requests_managed: bool = False
+    memory_limits_managed: bool = False
+
+
 PodWarning = Literal[
     "NoPrometheusPods",
     "NoPrometheusCPUMetrics",
@@ -42,6 +51,7 @@ class K8sObjectData(pd.BaseModel):
     container: str
     pods: list[PodData] = []
     hpa: Optional[HPAData]
+    vpa: Optional[VPAData] = None
     namespace: str
     kind: KindLiteral
     allocations: ResourceAllocations
@@ -97,6 +107,7 @@ class K8sObjectData(pd.BaseModel):
                 container=self.container,
                 pods=batch,
                 hpa=self.hpa,
+                vpa=self.vpa,
                 namespace=self.namespace,
                 kind=self.kind,
                 allocations=self.allocations,

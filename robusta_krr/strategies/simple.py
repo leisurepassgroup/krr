@@ -36,6 +36,10 @@ class SimpleStrategySettings(StrategySettings):
         False,
         description="Whether to calculate recommendations even when there is an HPA scaler defined on that resource.",
     )
+    allow_vpa: bool = pd.Field(
+        False,
+        description="Whether to calculate recommendations for CPU/memory fields managed by a Vertical Pod Autoscaler.",
+    )
     use_oomkill_data: bool = pd.Field(
         False,
         description="Whether to bump the memory when OOMKills are detected (experimental).",
@@ -105,7 +109,12 @@ class SimpleStrategy(BaseStrategy[SimpleStrategySettings]):
                 This strategy does not work with objects with HPA defined (Horizontal Pod Autoscaler).
                 If HPA is defined for CPU or Memory, the strategy will return "?" for that resource.
                 You can override this behaviour by passing the --allow-hpa flag
-                """)        
+                """)
+
+        if not self.settings.allow_vpa:
+            s += "\n" + textwrap.dedent(f"""\
+                When a Vertical Pod Autoscaler (VPA) manages requests or limits for a container, those fields show "?" unless you pass --allow-vpa.
+                """)
 
         s += "\nLearn more: [underline]https://github.com/robusta-dev/krr#algorithm[/underline]"
         return s
@@ -133,6 +142,13 @@ class SimpleStrategy(BaseStrategy[SimpleStrategySettings]):
             and not self.settings.allow_hpa
         ):
             return ResourceRecommendation.undefined(info="HPA detected")
+
+        if (
+            object_data.vpa is not None
+            and object_data.vpa.cpu_requests_managed
+            and not self.settings.allow_vpa
+        ):
+            return ResourceRecommendation.undefined(info="VPA detected")
 
         cpu_usage = self.settings.calculate_cpu_proposal(data)
         return ResourceRecommendation(request=cpu_usage, limit=None)
@@ -175,6 +191,18 @@ class SimpleStrategy(BaseStrategy[SimpleStrategySettings]):
             and not self.settings.allow_hpa
         ):
             return ResourceRecommendation.undefined(info="HPA detected")
+
+        if object_data.vpa is not None and not self.settings.allow_vpa:
+            vpa = object_data.vpa
+            if vpa.memory_requests_managed:
+                return ResourceRecommendation.undefined(info="VPA detected")
+            if vpa.memory_limits_managed:
+                memory_usage = self.settings.calculate_memory_proposal(data, max_oomkill_value)
+                return ResourceRecommendation(
+                    request=memory_usage,
+                    limit=float("nan"),
+                    info="VPA detected",
+                )
 
         memory_usage = self.settings.calculate_memory_proposal(data, max_oomkill_value)
         return ResourceRecommendation(

@@ -20,6 +20,7 @@ from kubernetes.client.models import (
 
 from robusta_krr.core.models.config import settings
 from robusta_krr.core.models.objects import HPAData, K8sObjectData, KindLiteral, PodData
+from robusta_krr.utils.vpa import resolve_vpa_control_for_container
 from robusta_krr.core.models.result import ResourceAllocations
 from robusta_krr.utils.object_like_dict import ObjectLikeDict
 
@@ -106,6 +107,7 @@ class ClusterLoader:
         logger.debug(f"Resources: {settings.resources}")
 
         self.__hpa_list = await self._try_list_hpa()
+        self.__vpa_spec_by_workload = await self._try_list_vpa()
         workload_object_lists = await asyncio.gather(
             self._list_deployments(),
             self._list_rollouts(),
@@ -250,6 +252,9 @@ class ClusterLoader:
             else:
                 annotations = item.metadata.annotations
 
+        vpa_spec = self.__vpa_spec_by_workload.get((namespace, kind, name))
+        vpa_resolved = resolve_vpa_control_for_container(vpa_spec, container.name) if vpa_spec else None
+
         obj = K8sObjectData(
             cluster=self.cluster,
             namespace=namespace,
@@ -258,6 +263,7 @@ class ClusterLoader:
             container=container.name,
             allocations=ResourceAllocations.from_container(container),
             hpa=self.__hpa_list.get((namespace, kind, name)),
+            vpa=vpa_resolved,
             labels=labels,
             annotations= annotations
         )
@@ -795,6 +801,71 @@ class ClusterLoader:
             logger.error(
                 "Will assume that there are no HPA. "
                 "Be careful as this may lead to inaccurate results if object actually has HPA."
+            )
+            return {}
+
+    def __parse_vpa_cluster_response(self, response: dict[str, Any]) -> dict[HPAKey, dict[str, Any]]:
+        """Map (namespace, kind, name) -> VPA spec for target workloads."""
+        result: dict[HPAKey, dict[str, Any]] = {}
+        for item in response.get("items") or []:
+            spec = item.get("spec") or {}
+            target = spec.get("targetRef") or {}
+            t_name = target.get("name")
+            t_kind = target.get("kind")
+            ns = (item.get("metadata") or {}).get("namespace")
+            if not t_name or not t_kind or not ns:
+                continue
+            key = (ns, t_kind, t_name)
+            if key in result:
+                logger.warning(
+                    "Multiple VerticalPodAutoscaler objects target %s/%s %s; using the first listed",
+                    ns,
+                    t_kind,
+                    t_name,
+                )
+                continue
+            result[key] = spec
+        return result
+
+    def _list_vertical_pod_autoscalers_sync(self) -> dict[str, Any]:
+        last_exc: Optional[ApiException] = None
+        for version in ("v1", "v1beta2", "v1beta1"):
+            try:
+                return self.custom_objects.list_cluster_custom_object(
+                    group="autoscaling.k8s.io",
+                    version=version,
+                    plural="verticalpodautoscalers",
+                )
+            except ApiException as e:
+                last_exc = e
+                if e.status == 404:
+                    continue
+                raise
+        if isinstance(last_exc, ApiException) and last_exc.status == 404:
+            return {"items": []}
+        if last_exc is not None:
+            raise last_exc
+        return {"items": []}
+
+    async def __list_vpa(self) -> dict[HPAKey, dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(self.executor, self._list_vertical_pod_autoscalers_sync)
+        return self.__parse_vpa_cluster_response(response)
+
+    async def _try_list_vpa(self) -> dict[HPAKey, dict[str, Any]]:
+        try:
+            return await self.__list_vpa()
+        except ApiException as e:
+            if e.status == 404:
+                logger.debug("VerticalPodAutoscaler CRD not found or API version unsupported in cluster %s", self.cluster)
+                return {}
+            logger.exception("Error listing VerticalPodAutoscaler in cluster %s: %s", self.cluster, e)
+            return {}
+        except Exception as e:
+            logger.exception("Error listing VerticalPodAutoscaler in cluster %s: %s", self.cluster, e)
+            logger.error(
+                "Will assume there are no VPA objects. "
+                "Install the VPA CRD or fix RBAC if you use Vertical Pod Autoscaler."
             )
             return {}
 
