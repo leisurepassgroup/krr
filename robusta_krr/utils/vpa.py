@@ -53,9 +53,18 @@ def resolve_vpa_control_for_container(vpa_spec: dict[str, Any], container_name: 
     """
     Given a VPA ``spec`` (only the spec object), return which request/limit fields VPA manages for ``container_name``.
 
-    Returns ``None`` if the container is excluded (mode ``Off``) or the spec is empty.
+    Returns ``None`` (so KRR still recommends) when:
+      - the spec is empty,
+      - ``spec.updatePolicy.updateMode`` is ``Off`` (VPA only computes recommendations and never
+        applies them to the workload, so requests/limits are still owned by the user), or
+      - the container is excluded via container policy ``mode: Off``.
     """
     if not vpa_spec:
+        return None
+
+    # updateMode defaults to "Auto" when unset. Only "Off" means VPA does not mutate the workload.
+    update_mode = (vpa_spec.get("updatePolicy") or {}).get("updateMode")
+    if update_mode == "Off":
         return None
 
     policies = (vpa_spec.get("resourcePolicy") or {}).get("containerPolicies")
