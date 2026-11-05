@@ -1,3 +1,4 @@
+import math
 import textwrap
 from datetime import timedelta
 
@@ -36,6 +37,10 @@ class SimpleLimitStrategySettings(StrategySettings):
     allow_hpa: bool = pd.Field(
         False,
         description="Whether to calculate recommendations even when there is an HPA scaler defined on that resource.",
+    )
+    allow_vpa: bool = pd.Field(
+        False,
+        description="Whether to calculate recommendations for CPU/memory fields managed by a Vertical Pod Autoscaler.",
     )
     use_oomkill_data: bool = pd.Field(
         False,
@@ -108,6 +113,11 @@ class SimpleLimitStrategy(BaseStrategy[SimpleLimitStrategySettings]):
                 You can override this behaviour by passing the --allow-hpa flag
                 """)
 
+        if not self.settings.allow_vpa:
+            s += "\n" + textwrap.dedent(f"""\
+                When a Vertical Pod Autoscaler (VPA) manages requests or limits for a container, those fields show "?" unless you pass --allow-vpa.
+                """)
+
         s += "\nLearn more: [underline]https://github.com/robusta-dev/krr#algorithm[/underline]"
         return s
 
@@ -137,6 +147,16 @@ class SimpleLimitStrategy(BaseStrategy[SimpleLimitStrategySettings]):
 
         cpu_request = self.settings.calculate_cpu_percentile(data, self.settings.cpu_request)
         cpu_limit = self.settings.calculate_cpu_percentile(data, self.settings.cpu_limit)
+        if object_data.vpa is not None and not self.settings.allow_vpa:
+            vpa = object_data.vpa
+            if vpa.cpu_requests_managed:
+                cpu_request = float("nan")
+            if vpa.cpu_limits_managed:
+                cpu_limit = float("nan")
+            if math.isnan(cpu_request) and math.isnan(cpu_limit):
+                return ResourceRecommendation.undefined(info="VPA detected")
+            if math.isnan(cpu_request) or math.isnan(cpu_limit):
+                return ResourceRecommendation(request=cpu_request, limit=cpu_limit, info="VPA detected")
         return ResourceRecommendation(request=cpu_request, limit=cpu_limit)
 
     def __calculate_memory_proposal(
@@ -179,8 +199,24 @@ class SimpleLimitStrategy(BaseStrategy[SimpleLimitStrategySettings]):
             return ResourceRecommendation.undefined(info="HPA detected")
 
         memory_usage = self.settings.calculate_memory_proposal(data, max_oomkill_value)
+        mem_request = memory_usage
+        mem_limit = memory_usage
+        if object_data.vpa is not None and not self.settings.allow_vpa:
+            vpa = object_data.vpa
+            if vpa.memory_requests_managed:
+                mem_request = float("nan")
+            if vpa.memory_limits_managed:
+                mem_limit = float("nan")
+            if math.isnan(mem_request) and math.isnan(mem_limit):
+                return ResourceRecommendation.undefined(info="VPA detected")
+            if math.isnan(mem_request) or math.isnan(mem_limit):
+                return ResourceRecommendation(
+                    request=mem_request,
+                    limit=mem_limit,
+                    info="VPA detected",
+                )
         return ResourceRecommendation(
-            request=memory_usage, limit=memory_usage, info="OOMKill detected" if oomkill_detected else None
+            request=mem_request, limit=mem_limit, info="OOMKill detected" if oomkill_detected else None
         )
 
     def run(self, history_data: MetricsPodData, object_data: K8sObjectData) -> RunResult:

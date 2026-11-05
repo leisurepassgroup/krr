@@ -20,6 +20,7 @@ from kubernetes.client.models import (
 
 from robusta_krr.core.models.config import settings
 from robusta_krr.core.models.objects import HPAData, K8sObjectData, KindLiteral, PodData
+from robusta_krr.utils.vpa import resolve_vpa_control_for_container
 from robusta_krr.core.models.result import ResourceAllocations
 from robusta_krr.utils.object_like_dict import ObjectLikeDict
 
@@ -58,6 +59,13 @@ class ClusterLoader:
         self.__jobs_for_cronjobs: dict[str, list[V1Job]] = {}
         self.__jobs_loading_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.__namespaces: Union[list[str, None]] = None
+
+        # Lazily-created dynamic client and a cache for owner objects fetched while walking
+        # ownerReferences to match VPAs that target owning CRDs (see __find_vpa_spec_for_workload).
+        self.__dynamic_client: Optional[Any] = None
+        self.__owner_object_cache: dict[tuple[str, str, str, str], Optional[Any]] = {}
+        # Max levels to climb the ownerReferences chain when matching a VPA to a workload.
+        self.__vpa_owner_chain_max_depth = 5
 
     @property
     def namespaces(self) -> Union[list[str], Literal["*"]]:
@@ -107,6 +115,7 @@ class ClusterLoader:
         logger.debug(f"Resources: {settings.resources}")
 
         self.__hpa_list = await self._try_list_hpa()
+        self.__vpa_spec_by_workload = await self._try_list_vpa()
         workload_object_lists = await asyncio.gather(
             self._list_deployments(),
             self._list_rollouts(),
@@ -252,6 +261,9 @@ class ClusterLoader:
             else:
                 annotations = item.metadata.annotations
 
+        vpa_spec = self.__find_vpa_spec_for_workload(item, namespace, kind, name)
+        vpa_resolved = resolve_vpa_control_for_container(vpa_spec, container.name) if vpa_spec else None
+
         obj = K8sObjectData(
             cluster=self.cluster,
             namespace=namespace,
@@ -260,11 +272,130 @@ class ClusterLoader:
             container=container.name,
             allocations=ResourceAllocations.from_container(container),
             hpa=self.__hpa_list.get((namespace, kind, name)),
+            vpa=vpa_resolved,
             labels=labels,
             annotations=annotations,
         )
         obj._api_resource = item
         return obj
+
+    @staticmethod
+    def __get_owner_references(item: Any) -> list[Any]:
+        metadata = getattr(item, "metadata", None)
+        if metadata is None:
+            return []
+        return (
+            getattr(metadata, "owner_references", None)
+            or getattr(metadata, "ownerReferences", None)
+            or []
+        )
+
+    @staticmethod
+    def __owner_attrs(owner: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        api_version = getattr(owner, "api_version", None) or getattr(owner, "apiVersion", None)
+        kind = getattr(owner, "kind", None)
+        name = getattr(owner, "name", None)
+        return api_version, kind, name
+
+    def __get_dynamic_client(self) -> Optional[Any]:
+        if self.__dynamic_client is None:
+            try:
+                from kubernetes.dynamic import DynamicClient
+
+                self.__dynamic_client = DynamicClient(self.api_client)
+            except Exception as e:
+                logger.debug("Could not create dynamic client for owner traversal in %s: %s", self.cluster, e)
+                self.__dynamic_client = False  # sentinel: do not retry
+        return self.__dynamic_client or None
+
+    def __fetch_owner_object(self, namespace: str, api_version: str, kind: str, name: str) -> Optional[Any]:
+        """Fetch an owner object so we can read its own ownerReferences. Cached and best-effort."""
+        cache_key = (namespace, api_version, kind, name)
+        if cache_key in self.__owner_object_cache:
+            return self.__owner_object_cache[cache_key]
+
+        result: Optional[Any] = None
+        dyn = self.__get_dynamic_client()
+        if dyn is not None:
+            try:
+                resource = dyn.resources.get(api_version=api_version, kind=kind)
+                result = resource.get(name=name, namespace=namespace)
+            except Exception as e:
+                logger.debug(
+                    "Could not fetch owner %s/%s %s in %s while matching VPA: %s",
+                    api_version,
+                    kind,
+                    name,
+                    namespace,
+                    e,
+                )
+                result = None
+
+        self.__owner_object_cache[cache_key] = result
+        return result
+
+    def __match_vpa_through_owners(
+        self,
+        namespace: str,
+        owner_references: list[Any],
+        depth: int,
+        visited: set[tuple[str, str]],
+    ) -> Optional[dict[str, Any]]:
+        if depth > self.__vpa_owner_chain_max_depth or not owner_references:
+            return None
+
+        for owner in owner_references:
+            api_version, owner_kind, owner_name = self.__owner_attrs(owner)
+            if not owner_kind or not owner_name:
+                continue
+
+            owned = self.__vpa_spec_by_workload.get((namespace, owner_kind, owner_name))
+            if owned is not None:
+                return owned
+
+            visit_key = (owner_kind, owner_name)
+            if visit_key in visited:
+                continue
+            visited.add(visit_key)
+
+            if not api_version:
+                continue
+
+            owner_object = self.__fetch_owner_object(namespace, api_version, owner_kind, owner_name)
+            if owner_object is None:
+                continue
+
+            spec = self.__match_vpa_through_owners(
+                namespace, self.__get_owner_references(owner_object), depth + 1, visited
+            )
+            if spec is not None:
+                return spec
+
+        return None
+
+    def __find_vpa_spec_for_workload(
+        self, item: AnyKubernetesAPIObject, namespace: str, kind: str, name: str
+    ) -> Optional[dict[str, Any]]:
+        """Match a VPA to a workload.
+
+        VPA targetRef may point either directly at the scanned workload or at a CRD (e.g.
+        ``Alertmanager``, ``Prometheus``, ``Rollout``) that owns the generated workload. Since KRR
+        scans the generated workload (e.g. the ``StatefulSet`` named ``alertmanager-<name>``), we
+        first try a direct (kind, name) match and then walk the ownerReferences chain (fetching
+        intermediate owners as needed) to find a VPA that targets an owning resource in the same
+        namespace.
+        """
+        direct = self.__vpa_spec_by_workload.get((namespace, kind, name))
+        if direct is not None:
+            return direct
+
+        # Nothing to match against; skip any owner lookups/API calls entirely.
+        if not self.__vpa_spec_by_workload:
+            return None
+
+        return self.__match_vpa_through_owners(
+            namespace, self.__get_owner_references(item), depth=1, visited=set()
+        )
 
     def _should_list_resource(self, resource: str) -> bool:
         if settings.resources == "*":
@@ -790,6 +921,71 @@ class ClusterLoader:
             logger.error(
                 "Will assume that there are no HPA. "
                 "Be careful as this may lead to inaccurate results if object actually has HPA."
+            )
+            return {}
+
+    def __parse_vpa_cluster_response(self, response: dict[str, Any]) -> dict[HPAKey, dict[str, Any]]:
+        """Map (namespace, kind, name) -> VPA spec for target workloads."""
+        result: dict[HPAKey, dict[str, Any]] = {}
+        for item in response.get("items") or []:
+            spec = item.get("spec") or {}
+            target = spec.get("targetRef") or {}
+            t_name = target.get("name")
+            t_kind = target.get("kind")
+            ns = (item.get("metadata") or {}).get("namespace")
+            if not t_name or not t_kind or not ns:
+                continue
+            key = (ns, t_kind, t_name)
+            if key in result:
+                logger.warning(
+                    "Multiple VerticalPodAutoscaler objects target %s/%s %s; using the first listed",
+                    ns,
+                    t_kind,
+                    t_name,
+                )
+                continue
+            result[key] = spec
+        return result
+
+    def _list_vertical_pod_autoscalers_sync(self) -> dict[str, Any]:
+        last_exc: Optional[ApiException] = None
+        for version in ("v1", "v1beta2", "v1beta1"):
+            try:
+                return self.custom_objects.list_cluster_custom_object(
+                    group="autoscaling.k8s.io",
+                    version=version,
+                    plural="verticalpodautoscalers",
+                )
+            except ApiException as e:
+                last_exc = e
+                if e.status == 404:
+                    continue
+                raise
+        if isinstance(last_exc, ApiException) and last_exc.status == 404:
+            return {"items": []}
+        if last_exc is not None:
+            raise last_exc
+        return {"items": []}
+
+    async def __list_vpa(self) -> dict[HPAKey, dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(self.executor, self._list_vertical_pod_autoscalers_sync)
+        return self.__parse_vpa_cluster_response(response)
+
+    async def _try_list_vpa(self) -> dict[HPAKey, dict[str, Any]]:
+        try:
+            return await self.__list_vpa()
+        except ApiException as e:
+            if e.status == 404:
+                logger.debug("VerticalPodAutoscaler CRD not found or API version unsupported in cluster %s", self.cluster)
+                return {}
+            logger.exception("Error listing VerticalPodAutoscaler in cluster %s: %s", self.cluster, e)
+            return {}
+        except Exception as e:
+            logger.exception("Error listing VerticalPodAutoscaler in cluster %s: %s", self.cluster, e)
+            logger.error(
+                "Will assume there are no VPA objects. "
+                "Install the VPA CRD or fix RBAC if you use Vertical Pod Autoscaler."
             )
             return {}
 

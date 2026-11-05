@@ -32,6 +32,7 @@ RESULT = """
                     }
                 ],
                 "hpa": null,
+                "vpa": null,
                 "namespace": "default",
                 "kind": "Deployment",
                 "allocations": {
@@ -91,6 +92,7 @@ RESULT = """
             "memory_buffer_percentage": 15.0,
             "points_required": 100,
             "allow_hpa": false,
+            "allow_vpa": false,
             "use_oomkill_data": false,
             "oom_memory_buffer_percentage": 25.0
         }
@@ -138,6 +140,7 @@ RESULT = """
             "memory_buffer_percentage": "15",
             "points_required": "100",
             "allow_hpa": false,
+            "allow_vpa": false,
             "use_oomkill_data": false,
             "oom_memory_buffer_percentage": "25"
         },
